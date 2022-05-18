@@ -1,0 +1,169 @@
+default:
+  image: docker/node:16.3.0
+
+cache:
+  paths:
+    - node_modules
+
+variables:
+  CI: "false"
+
+stages:
+  - npm_build
+  - npm_test
+  - npm_deploy
+  - docker_image
+  - k8s_deploy_stage
+  - k8s_deploy_prod
+
+.npmrc_create:
+  before_script:
+    - |
+      {
+        echo registry=https://local_repo_url/artifactory/api/npm/npm/
+        echo //local_repo_url/artifactory/api/npm/npm/:_password=$ART_BASE64_PASS
+        echo //local_repo_url/artifactory/api/npm/npm/:username=$ART_USER
+        echo //local_repo_url/artifactory/api/npm/npm/:email=$ART_EMAIL
+        echo //local_repo_url/artifactory/api/npm/npm/:always-auth=true
+      } > .npmrc
+
+.docker_build:
+  before_script:
+    - docker login -u $DOCKER_LOGIN -p $DOCKER_PASS $DOCKER_BASE
+    - cd /opt/
+    - wget https://$ART_USER:$ART_PASS@local_repo_url/artifactory/npm/project_name/-/project_name-$CI_COMMIT_TAG.tgz
+    - tar xzf project_name-$CI_COMMIT_TAG.tgz
+    - |
+        {
+          echo 'server {'
+          echo '  listen 7001 default_server;'
+          echo '  server_name  _;'
+          echo '  location / {'
+          echo '    root   /usr/share/nginx/html;'
+          echo '    index  index.html index.htm;'
+          echo '    try_files $uri /index.html;'
+          echo '    error_page 405 =200 $uri;'
+          echo '  }'
+          echo '}'
+        } > default.conf
+    - |
+        {
+          echo FROM docker/nginx:latest
+          echo COPY ./default.conf /etc/nginx/conf.d/
+          echo COPY ./package/out /usr/share/nginx/html
+          echo 'CMD ["nginx", "-g", "daemon off;"]'
+        } > Dockerfile
+#     - |
+#         {
+#           echo '{ "features": { "buildkit": true } }'
+#         } > /etc/docker/daemon.json
+    - docker build . -t local_repo_url/docker/`echo $CI_PROJECT_NAME | tr '[:upper:]' '[:lower:]'`/project_name:`echo $CI_COMMIT_TAG | tr '[:upper:]' '[:lower:]'`
+    - docker tag local_repo_url/docker/`echo $CI_PROJECT_NAME | tr '[:upper:]' '[:lower:]'`/project_name:`echo $CI_COMMIT_TAG | tr '[:upper:]' '[:lower:]'` local_repo_url/docker/`echo $CI_PROJECT_NAME | tr '[:upper:]' '[:lower:]'`/project_name:latest
+    - docker push local_repo_url/docker/`echo $CI_PROJECT_NAME | tr '[:upper:]' '[:lower:]'`/project_name:`echo $CI_COMMIT_TAG | tr '[:upper:]' '[:lower:]'`
+    - docker push local_repo_url/docker/`echo $CI_PROJECT_NAME | tr '[:upper:]' '[:lower:]'`/project_name:latest
+
+.k8s_init_stage:
+  before_script:
+    - export HOME=$CI_PROJECT_DIR
+    - kubectl config set-cluster devenv --server="${K8S_SERVER}"
+    - kubectl config set clusters.k8s.certificate-authority-data ${K8S_CERTIFICATE_AUTHORITY_DATA}
+    - kubectl config set-credentials gitlab --token="${K8S_USER_TOKEN}"
+    - kubectl config set-context default --cluster=devenv --user=gitlab
+    - kubectl config use-context default
+
+.k8s_init_prod:
+  before_script:
+    - export HOME=$CI_PROJECT_DIR
+    - kubectl config set-cluster devenv --server="${K8S_PROD_SERVER}"
+    - kubectl config set clusters.k8s.certificate-authority-data ${K8S_PROD_CERTIFICATE_AUTHORITY_DATA}
+    - kubectl config set-credentials gitlab --token="${K8S_PROD_USER_TOKEN}"
+    - kubectl config set-context default --cluster=devenv --user=gitlab
+    - kubectl config use-context default
+
+npm_build:
+  extends: .npmrc_create
+  stage: npm_build
+  needs: []
+  script:
+    - cd /builds/Front/project_name
+    - yarn install
+    - npx next build
+    - npx next export
+  artifacts:
+    paths:
+      - "out"
+  rules:
+    - if: ($CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-rc$/ || $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-master$/)
+
+
+npm_test:
+  extends: .npmrc_create
+  needs: [npm_build]
+  stage: npm_test
+  script:
+    - cd app/
+    - npm version $CI_COMMIT_TAG
+    - npm run test
+  artifacts:
+    paths:
+      - '*/build'
+  rules:
+   - if: ($CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-rc$/ || $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-master$/)
+
+npm_deploy:
+  extends: .npmrc_create
+  stage: npm_deploy
+  #needs: [npm_test]
+  script:
+    - cd /builds/Front/project_name
+    - git config --global user.email "email@example.com"
+    - git config --global user.name "git_user"
+    - npx yarn publish --new-version $CI_COMMIT_TAG
+  rules:
+    - if: ($CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-rc$/ || $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-master$/)
+
+docker_image:
+  # variables:
+  #   MICROSERVICE: app
+  extends: .docker_build
+  stage: docker_image
+  needs: [npm_deploy]
+  image: docker/docker:latest
+  script:
+    - echo $MICROSERVICE
+    - echo $CI_COMMIT_TAG
+  rules:
+    - if: ($CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-rc$/ || $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-master$/)
+
+
+
+k8s_deploy_stage:
+  image:
+    name: docker/bitnami/kubectl:latest
+    entrypoint: [""]
+  stage: k8s_deploy_stage
+  needs: [docker_image]
+  extends: .k8s_init_stage
+  script:
+    - kubectl --insecure-skip-tls-verify replace --force -f deployment_stage.yaml
+    - grep "host:" deployment_stage.yaml | awk '{print $3}'
+  environment:
+    name: namespace
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-rc$/
+
+k8s_deploy_prod:
+  image:
+    name: docker/bitnami/kubectl:latest
+    entrypoint: [""]
+  stage: k8s_deploy_prod
+  needs: [docker_image]
+  extends: .k8s_init_prod
+  script:
+    - kubectl --insecure-skip-tls-verify replace --force -f deployment_prod.yaml
+    - grep "host:" deployment_prod.yaml | awk '{print $3}'
+  environment:
+    name: namespace
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-master$/
+
